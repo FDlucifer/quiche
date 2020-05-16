@@ -302,6 +302,16 @@ const MAX_AMPLIFICATION_FACTOR: usize = 3;
 // This represents more or less how many ack blocks can fit in a typical packet.
 const MAX_ACK_RANGES: usize = 68;
 
+// The default size of the receiver connection flow control window.
+const DEFAULT_CONNECTION_WINDOW: u64 = 48 * 1024;
+
+// The maximum size of the receiver connection flow control window.
+const MAX_CONNECTION_WINDOW: u64 = 24 * 1024 * 1024;
+
+// How much larger the connection flow control window need to be larger than
+// the stream flow control window.
+const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
+
 /// A specialized [`Result`] type for quiche operations.
 ///
 /// This type is used throughout quiche's public API for any operation that
@@ -776,12 +786,11 @@ pub struct Connection {
     /// Total number of bytes received from the peer.
     rx_data: u64,
 
-    /// Local flow control limit for the connection.
-    max_rx_data: u64,
+    /// Total number of bytes read from the application.
+    rx_data_consumed: u64,
 
-    /// Updated local flow control limit for the connection. This is used to
-    /// trigger sending MAX_DATA frames after a certain threshold.
-    max_rx_data_next: u64,
+    /// Receiver flow controller.
+    flow_control: flowcontrol::FlowControl,
 
     /// Whether we send MAX_DATA frame.
     almost_full: bool,
@@ -1112,8 +1121,11 @@ impl Connection {
             sent_count: 0,
 
             rx_data: 0,
-            max_rx_data,
-            max_rx_data_next: max_rx_data,
+            rx_data_consumed: 0,
+            flow_control: flowcontrol::FlowControl::new(
+                max_rx_data,
+                cmp::min(max_rx_data, DEFAULT_CONNECTION_WINDOW),
+            ),
             almost_full: false,
 
             tx_data: 0,
@@ -2084,36 +2096,9 @@ impl Connection {
                 }
             }
 
-            // Create MAX_DATA frame as needed.
-            if self.almost_full {
-                let frame = frame::Frame::MaxData {
-                    max: self.max_rx_data_next,
-                };
-
-                if push_frame_to_pkt!(frames, frame, payload_len, left) {
-                    self.almost_full = false;
-
-                    // Commits the new max_rx_data limit.
-                    self.max_rx_data = self.max_rx_data_next;
-
-                    ack_eliciting = true;
-                    in_flight = true;
-                }
-            }
-
-            // Create DATA_BLOCKED frame.
-            if let Some(limit) = self.blocked_limit {
-                let frame = frame::Frame::DataBlocked { limit };
-
-                if push_frame_to_pkt!(frames, frame, payload_len, left) {
-                    self.blocked_limit = None;
-
-                    ack_eliciting = true;
-                    in_flight = true;
-                }
-            }
-
             // Create MAX_STREAM_DATA frames as needed.
+            // MAX_DATA may need to be sent when updating MAX_STREAM_DATA,
+            // so we send update MAX_STREAM_DATA before MAX_DATA.
             for stream_id in self.streams.almost_full() {
                 let stream = match self.streams.get_mut(stream_id) {
                     Some(v) => v,
@@ -2126,6 +2111,9 @@ impl Connection {
                     },
                 };
 
+                // Autotune the stream window size.
+                stream.recv.autotune_window(now, self.recovery.rtt());
+
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
                     max: stream.recv.max_data_next(),
@@ -2134,7 +2122,43 @@ impl Connection {
                 if push_frame_to_pkt!(frames, frame, payload_len, left) {
                     stream.recv.update_max_data();
 
+                    // Make sure the connection window always has some
+                    // room compared to the stream window. If MAX_DATA
+                    // update is necessary, send a new one.
+                    if self.flow_control.ensure_window_lower_bound(
+                        (stream.recv.window() as f64 * CONNECTION_WINDOW_FACTOR)
+                            as u64,
+                    ) && self
+                        .flow_control
+                        .should_update_max_data(self.rx_data_consumed)
+                    {
+                        self.almost_full = true;
+                    }
+
                     self.streams.mark_almost_full(stream_id, false);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create MAX_DATA frame as needed.
+            if self.almost_full {
+                // Autotune the maximum window size.
+                self.flow_control.autotune_window(
+                    now,
+                    self.recovery.rtt(),
+                    MAX_CONNECTION_WINDOW,
+                );
+
+                let frame = frame::Frame::MaxData {
+                    max: self.flow_control.max_data_next(self.rx_data_consumed),
+                };
+
+                if push_frame_to_pkt!(frames, frame, payload_len, left) {
+                    self.flow_control
+                        .update_max_data(self.rx_data_consumed, now);
+                    self.almost_full = false;
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -2152,6 +2176,18 @@ impl Connection {
 
                 if push_frame_to_pkt!(frames, frame, payload_len, left) {
                     self.streams.mark_blocked(stream_id, false, 0);
+
+                    ack_eliciting = true;
+                    in_flight = true;
+                }
+            }
+
+            // Create DATA_BLOCKED frame as needed.
+            if let Some(limit) = self.blocked_limit {
+                let frame = frame::Frame::DataBlocked { limit };
+
+                if push_frame_to_pkt!(frames, frame, payload_len, left) {
+                    self.blocked_limit = None;
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -2509,7 +2545,7 @@ impl Connection {
 
         let (read, fin) = stream.recv.pop(out)?;
 
-        self.max_rx_data_next = self.max_rx_data_next.saturating_add(read as u64);
+        self.rx_data_consumed = self.rx_data_consumed.saturating_add(read as u64);
 
         let readable = stream.is_readable();
 
@@ -2529,6 +2565,13 @@ impl Connection {
             self.streams.collect(stream_id, local);
         }
 
+        if self
+            .flow_control
+            .should_update_max_data(self.rx_data_consumed)
+        {
+            self.almost_full = true;
+        }
+
         qlog_with!(self.qlog_streamer, q, {
             let ev = qlog::event::Event::h3_data_moved(
                 stream_id.to_string(),
@@ -2540,10 +2583,6 @@ impl Connection {
             );
             q.add_event(ev).ok();
         });
-
-        if self.should_update_max_data() {
-            self.almost_full = true;
-        }
 
         Ok((read, fin))
     }
@@ -3238,7 +3277,7 @@ impl Connection {
 
                 self.rx_data += stream.recv.reset(final_size)? as u64;
 
-                if self.rx_data > self.max_rx_data {
+                if self.rx_data > self.flow_control.max_data() {
                     return Err(Error::FlowControl);
                 }
             },
@@ -3368,13 +3407,6 @@ impl Connection {
                     return Err(Error::InvalidStreamState);
                 }
 
-                // Check for flow control limits.
-                let data_len = data.len() as u64;
-
-                if self.rx_data + data_len > self.max_rx_data {
-                    return Err(Error::FlowControl);
-                }
-
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
                 //
@@ -3393,13 +3425,18 @@ impl Connection {
                     Err(e) => return Err(e),
                 };
 
-                stream.recv.push(data)?;
+                let rx_inc = stream.recv.push(data)?;
 
                 if stream.is_readable() {
                     self.streams.mark_readable(stream_id, true);
                 }
 
-                self.rx_data += data_len;
+                // Check for the connection flow control limits.
+                if self.rx_data + rx_inc > self.flow_control.max_data() {
+                    return Err(Error::FlowControl);
+                }
+
+                self.rx_data = self.rx_data.saturating_add(rx_inc);
             },
 
             frame::Frame::MaxData { max } => {
@@ -3515,15 +3552,6 @@ impl Connection {
             .on_pkt_num_space_discarded(epoch, self.is_established());
 
         trace!("{} dropped epoch {} state", self.trace_id, epoch);
-    }
-
-    /// Returns true if the connection-level flow control needs to be updated.
-    ///
-    /// This happens when the new max data limit is at least double the amount
-    /// of data that can be received before blocking.
-    fn should_update_max_data(&self) -> bool {
-        self.max_rx_data_next != self.max_rx_data &&
-            self.max_rx_data_next / 2 > self.max_rx_data - self.rx_data
     }
 
     /// Returns the idle timeout value.
@@ -4761,6 +4789,14 @@ mod tests {
         // Ignore ACK.
         iter.next().unwrap();
 
+        // MAX_STREAM_DATA comes first and MAX_DATA comes later.
+        assert_eq!(
+            iter.next(),
+            Some(&frame::Frame::MaxStreamData {
+                stream_id: 4,
+                max: 30
+            })
+        );
         assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 46 }));
     }
 
@@ -4814,7 +4850,7 @@ mod tests {
 
         let frames = [frame::Frame::Stream {
             stream_id: 4,
-            data: stream::RangeBuf::from(b"aaaaaaa", 0, false),
+            data: stream::RangeBuf::from(b"aaaaaaaaa", 0, false),
         }];
 
         let pkt_type = packet::Type::Short;
@@ -4825,7 +4861,7 @@ mod tests {
 
         let frames = [frame::Frame::Stream {
             stream_id: 4,
-            data: stream::RangeBuf::from(b"a", 7, false),
+            data: stream::RangeBuf::from(b"a", 9, false),
         }];
 
         let len = pipe
@@ -4845,7 +4881,7 @@ mod tests {
             iter.next(),
             Some(&frame::Frame::MaxStreamData {
                 stream_id: 4,
-                max: 22,
+                max: 24,
             })
         );
     }
@@ -6433,6 +6469,7 @@ pub use crate::stream::StreamIter;
 
 mod crypto;
 mod ffi;
+mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;

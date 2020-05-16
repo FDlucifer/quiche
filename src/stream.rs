@@ -31,13 +31,22 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::Error;
 use crate::Result;
 
+use crate::flowcontrol;
 use crate::ranges;
 
 const MAX_WRITE_SIZE: usize = 1000;
+
+/// The default size of the receiver stream flow control window.
+const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+
+/// The maximum size of the receiver stream flow control window.
+const MAX_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
@@ -549,11 +558,8 @@ pub struct RecvBuf {
     /// The total length of data received on this stream.
     len: u64,
 
-    /// The maximum offset the peer is allowed to send us.
-    max_data: u64,
-
-    /// The updated maximum offset the peer is allowed to send us.
-    max_data_next: u64,
+    /// Receiver flow controller.
+    flow_control: flowcontrol::FlowControl,
 
     /// The final stream offset received from the peer, if any.
     fin_off: Option<u64>,
@@ -566,8 +572,10 @@ impl RecvBuf {
     /// Creates a new receive buffer.
     fn new(max_data: u64) -> RecvBuf {
         RecvBuf {
-            max_data,
-            max_data_next: max_data,
+            flow_control: flowcontrol::FlowControl::new(
+                max_data,
+                cmp::min(max_data, DEFAULT_STREAM_WINDOW),
+            ),
             ..RecvBuf::default()
         }
     }
@@ -577,8 +585,12 @@ impl RecvBuf {
     /// This also takes care of enforcing stream flow control limits, as well
     /// as handling incoming data that overlaps data that is already in the
     /// buffer.
-    pub fn push(&mut self, buf: RangeBuf) -> Result<()> {
-        if buf.max_off() > self.max_data {
+    ///
+    /// Returns how many bytes increased in the largest offset.
+    /// It will return 0 when the inserted data is duplicated or overlapped and
+    /// doesn't move the largest offset.
+    pub fn push(&mut self, buf: RangeBuf) -> Result<u64> {
+        if buf.max_off() > self.max_data() {
             return Err(Error::FlowControl);
         }
 
@@ -602,13 +614,13 @@ impl RecvBuf {
         // We already saved the final offset, so there's nothing else we
         // need to keep from the RangeBuf if it's empty.
         if self.fin_off.is_some() && buf.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // No need to process an empty buffer with the fin flag, if we already
         // know the final size.
         if buf.fin() && buf.is_empty() && self.fin_off.is_some() {
-            return Ok(());
+            return Ok(0);
         }
 
         if buf.fin() {
@@ -617,7 +629,7 @@ impl RecvBuf {
 
         // No need to store empty buffer that doesn't carry the fin flag.
         if !buf.fin() && buf.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         // Check if data is fully duplicate, that is the buffer's max offset is
@@ -629,15 +641,18 @@ impl RecvBuf {
             // By this point all spurious empty buffers should have already been
             // discarded, so allowing empty buffers here should be safe.
             if !buf.is_empty() {
-                return Ok(());
+                return Ok(0);
             }
         }
 
         if self.drain {
-            return Ok(());
+            return Ok(0);
         }
 
         let mut tmp_buf = Some(buf);
+
+        // How many bytes the receive buffer right edge (max_off()) increased.
+        let mut len_inc = 0;
 
         while let Some(mut buf) = tmp_buf {
             tmp_buf = None;
@@ -654,7 +669,7 @@ impl RecvBuf {
             for b in &self.data {
                 // New buffer is fully contained in existing buffer.
                 if buf.off() >= b.off() && buf.max_off() <= b.max_off() {
-                    return Ok(());
+                    return Ok(0);
                 }
 
                 // New buffer's start overlaps existing buffer.
@@ -668,12 +683,17 @@ impl RecvBuf {
                 }
             }
 
-            self.len = cmp::max(self.len, buf.max_off());
+            self.len = if buf.max_off() > self.len {
+                len_inc += buf.max_off() - self.len;
+                buf.max_off()
+            } else {
+                self.len
+            };
 
             self.data.push(buf);
         }
 
-        Ok(())
+        Ok(len_inc)
     }
 
     /// Writes data from the receive buffer into the given output buffer.
@@ -720,8 +740,6 @@ impl RecvBuf {
             cap -= buf.len();
         }
 
-        self.max_data_next = self.max_data_next.saturating_add(len as u64);
-
         Ok((len, self.is_fin()))
     }
 
@@ -746,14 +764,30 @@ impl RecvBuf {
         Ok((final_size - self.len) as usize)
     }
 
+    /// Return the current window.
+    pub fn window(&mut self) -> u64 {
+        self.flow_control.window()
+    }
+
+    /// Return the current max_data limit.
+    pub fn max_data(&mut self) -> u64 {
+        self.flow_control.max_data()
+    }
+
     /// Commits the new max_data limit.
     pub fn update_max_data(&mut self) {
-        self.max_data = self.max_data_next;
+        self.flow_control.update_max_data(self.off, Instant::now());
     }
 
     /// Return the new max_data limit.
     pub fn max_data_next(&mut self) -> u64 {
-        self.max_data_next
+        self.flow_control.max_data_next(self.off)
+    }
+
+    /// Autotune the window size.
+    pub fn autotune_window(&mut self, now: Instant, rtt: Duration) {
+        self.flow_control
+            .autotune_window(now, rtt, MAX_STREAM_WINDOW);
     }
 
     /// Shuts down receiving data.
@@ -775,13 +809,10 @@ impl RecvBuf {
         self.off
     }
 
-    /// Returns true if we need to update the local flow control limit.
+    /// Returns true if we need to update the stream flow control limit.
     pub fn almost_full(&self) -> bool {
-        // Send MAX_STREAM_DATA when the new limit is at least double the
-        // amount of data that can be received before blocking.
         self.fin_off.is_none() &&
-            self.max_data_next != self.max_data &&
-            self.max_data_next / 2 > self.max_data - self.len
+            self.flow_control.should_update_max_data(self.off)
     }
 
     /// Returns true if the receive-side of the stream is complete.
@@ -1924,8 +1955,8 @@ mod tests {
         let second = RangeBuf::from(b"world", 5, false);
         let third = RangeBuf::from(b"something", 10, false);
 
-        assert_eq!(stream.recv.push(second), Ok(()));
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(second), Ok(10));
+        assert_eq!(stream.recv.push(first), Ok(0));
         assert!(!stream.recv.almost_full());
 
         assert_eq!(stream.recv.push(third), Err(Error::FlowControl));
@@ -1941,7 +1972,7 @@ mod tests {
         assert!(!stream.recv.almost_full());
 
         let third = RangeBuf::from(b"something", 10, false);
-        assert_eq!(stream.recv.push(third), Ok(()));
+        assert_eq!(stream.recv.push(third), Ok(9));
     }
 
     #[test]
@@ -1952,7 +1983,7 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"world", 5, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
         assert_eq!(stream.recv.push(second), Err(Error::FinalSize));
     }
 
@@ -1964,8 +1995,8 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"hello", 0, true);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
-        assert_eq!(stream.recv.push(second), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
+        assert_eq!(stream.recv.push(second), Ok(0));
 
         let mut buf = [0; 32];
 
@@ -1982,7 +2013,7 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"world", 5, true);
 
-        assert_eq!(stream.recv.push(second), Ok(()));
+        assert_eq!(stream.recv.push(second), Ok(10));
         assert_eq!(stream.recv.push(first), Err(Error::FinalSize));
     }
 
@@ -1994,7 +2025,7 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"world", 5, false);
 
-        assert_eq!(stream.recv.push(second), Ok(()));
+        assert_eq!(stream.recv.push(second), Ok(10));
         assert_eq!(stream.recv.push(first), Err(Error::FinalSize));
     }
 
@@ -2008,8 +2039,8 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, false);
         let second = RangeBuf::from(b"world", 5, true);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
-        assert_eq!(stream.recv.push(second), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
+        assert_eq!(stream.recv.push(second), Ok(5));
 
         let (len, fin) = stream.recv.pop(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"helloworld");
@@ -2025,7 +2056,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, true);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
         assert_eq!(stream.recv.reset(10), Err(Error::FinalSize));
     }
 
@@ -2036,7 +2067,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
         assert_eq!(stream.recv.reset(5), Ok(0));
         assert_eq!(stream.recv.reset(5), Ok(0));
     }
@@ -2048,7 +2079,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
         assert_eq!(stream.recv.reset(5), Ok(0));
         assert_eq!(stream.recv.reset(10), Err(Error::FinalSize));
     }
@@ -2060,7 +2091,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
         assert_eq!(stream.recv.reset(4), Err(Error::FinalSize));
     }
 
@@ -2240,7 +2271,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
 
         let mut buf = [0; 10];
 
@@ -2249,7 +2280,7 @@ mod tests {
         assert_eq!(fin, false);
 
         let first = RangeBuf::from(b"elloworld", 1, true);
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.push(first), Ok(5));
 
         let (len, fin) = stream.recv.pop(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"world");
